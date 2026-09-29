@@ -154,6 +154,50 @@ def list_cards(limit: int = 50) -> list[dict[str, Any]]:
     return out
 
 
+def _extract_native_sql(dataset_query: dict[str, Any]) -> str | None:
+    """Extrait le SQL natif d'un dataset_query, ancien ET nouveau format.
+
+    Metabase <=62 : {"type": "native", "native": {"query": "..."}}.
+    Metabase >=63 (query builder v2) : {"stages": [{"lib/type":
+    "mbql.stage/native", "native": "..."}, ...]} — le SQL est une string
+    brute (pas un sous-objet), en général sur le dernier stage natif.
+    """
+    native_obj = dataset_query.get("native")
+    if isinstance(native_obj, dict) and native_obj.get("query"):
+        return native_obj["query"]
+
+    stages = dataset_query.get("stages") or []
+    for stage in reversed(stages):
+        if stage.get("lib/type") == "mbql.stage/native":
+            native = stage.get("native")
+            if isinstance(native, str):
+                return native
+            if isinstance(native, dict):
+                return native.get("query")
+    return None
+
+
+def _query_type(card: dict[str, Any]) -> str | None:
+    """query_type est exposé au niveau racine de la card depuis la v63 ;
+    fallback sur dataset_query.type pour les instances plus anciennes."""
+    return card.get("query_type") or (card.get("dataset_query") or {}).get("type")
+
+
+def _extract_template_tags(dataset_query: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extrait les template-tags (variables `{{...}}` du SQL natif), ancien
+    ET nouveau format. Ne pas confondre avec `card["parameters"]`, qui décrit
+    les filtres exposés au niveau dashboard, pas les tags bruts du SQL."""
+    native_obj = dataset_query.get("native")
+    if isinstance(native_obj, dict) and native_obj.get("template-tags"):
+        tags = native_obj["template-tags"]
+        return list(tags.values()) if isinstance(tags, dict) else tags
+
+    for stage in dataset_query.get("stages") or []:
+        if stage.get("lib/type") == "mbql.stage/native" and stage.get("template-tags"):
+            return stage["template-tags"]
+    return []
+
+
 @mcp.tool()
 def get_card(card_id: int) -> dict[str, Any]:
     """Détail d'une question : nom, description, base, SQL/définition, paramètres."""
@@ -165,9 +209,10 @@ def get_card(card_id: int) -> dict[str, Any]:
         "description": c.get("description"),
         "database_id": c.get("database_id"),
         "collection": (c.get("collection") or {}).get("name"),
-        "query_type": query.get("type"),
-        "native_sql": (query.get("native") or {}).get("query"),
+        "query_type": _query_type(c),
+        "native_sql": _extract_native_sql(query),
         "parameters": c.get("parameters", []),
+        "template_tags": _extract_template_tags(query),
     }
 
 
@@ -210,13 +255,30 @@ def get_dashboard(dashboard_id: int) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 @mcp.tool()
-def run_card(card_id: int, max_rows: int = DEFAULT_MAX_ROWS) -> dict[str, Any]:
+def run_card(
+    card_id: int,
+    max_rows: int = DEFAULT_MAX_ROWS,
+    parameters: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Exécute une question Metabase existante et renvoie ses lignes.
 
     Renvoie {columns, rows, row_count, truncated}. C'est la voie sûre :
     on rejoue une requête déjà validée plutôt que d'écrire du SQL.
+
+    `parameters` (optionnel) permet de filtrer comme le ferait une URL de
+    dashboard (ex. ?marque=Herstory&plateforme=Instagram) au lieu de subir
+    les valeurs par défaut des template-tags. Regarder `get_card(card_id)
+    ["template_tags"]` pour connaître les noms/types/défauts disponibles,
+    puis fournir une liste du type :
+      [{"type": "category", "target": ["variable", ["template-tag", "marque"]],
+        "value": "Herstory"},
+       {"type": "date/single", "target": ["variable", ["template-tag", "debut"]],
+        "value": "2026-01-01"}]
     """
-    payload = _post(f"/api/card/{card_id}/query")
+    body: dict[str, Any] = {}
+    if parameters is not None:
+        body["parameters"] = parameters
+    payload = _post(f"/api/card/{card_id}/query", json=body)
     return _format_rows(payload, max_rows)
 
 
