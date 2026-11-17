@@ -241,13 +241,24 @@ def get_dashboard(dashboard_id: int) -> dict[str, Any]:
     for dc in d.get("dashcards", d.get("ordered_cards", [])):
         card = dc.get("card") or {}
         if card.get("id"):
-            cards.append({"card_id": card["id"], "name": card.get("name")})
-    return {
+            entry = {"card_id": card["id"], "name": card.get("name")}
+            if dc.get("dashboard_tab_id") is not None:
+                entry["tab_id"] = dc["dashboard_tab_id"]
+            cards.append(entry)
+    result = {
         "id": d["id"],
         "name": d["name"],
         "description": d.get("description"),
         "cards": cards,
     }
+    # Onglets (absents si le dashboard n'en a pas) : ids réels à réutiliser dans
+    # `add_cards_to_dashboard(tabs=...)` pour conserver ou renommer un onglet.
+    if d.get("tabs"):
+        result["tabs"] = [
+            {"id": t["id"], "name": t.get("name"), "position": t.get("position")}
+            for t in d["tabs"]
+        ]
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -449,29 +460,68 @@ def create_dashboard(
     return {"id": d["id"], "name": d["name"]}
 
 
+def _dashboard_payload(
+    dashcards: list[dict[str, Any]],
+    parameters: list[dict[str, Any]] | None = None,
+    tabs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Corps du PUT /api/dashboard/{id}. Fonction pure, testable sans Metabase.
+
+    Avec `tabs`, chaque onglet reçoit une `position` (son rang dans la liste, sauf si
+    elle est donnée) et chaque dashcard qui porte un `dashboard_tab_id` doit viser un
+    onglet de la liste : Metabase répond sinon par un 500 sans message exploitable.
+    """
+    payload: dict[str, Any] = {"dashcards": dashcards}
+    if parameters is not None:
+        payload["parameters"] = parameters
+    if tabs is not None:
+        payload["tabs"] = [{"position": i, **tab} for i, tab in enumerate(tabs)]
+        known = {tab["id"] for tab in payload["tabs"]}
+        for dc in dashcards:
+            tab_id = dc.get("dashboard_tab_id")
+            if tab_id is not None and tab_id not in known:
+                raise ValueError(
+                    f"La dashcard {dc.get('id')} vise l'onglet {tab_id}, "
+                    f"absent de `tabs` (ids connus : {sorted(known)})."
+                )
+    return payload
+
+
 @mcp.tool()
 def add_cards_to_dashboard(
     dashboard_id: int,
     dashcards: list[dict[str, Any]],
     parameters: list[dict[str, Any]] | None = None,
+    tabs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Place des cards sur un dashboard (remplace la disposition existante).
 
     Chaque entrée de `dashcards` :
       {"id": -1, "card_id": 123, "row": 0, "col": 0, "size_x": 12, "size_y": 6,
+       "dashboard_tab_id": -1,
        "parameter_mappings": [
           {"parameter_id": "abcd1234", "card_id": 123,
            "target": ["dimension", ["template-tag", "format"]]}
        ]}
     Utiliser des `id` négatifs distincts (-1, -2, …) pour les nouvelles dashcards.
     `parameters` (optionnel) met aussi à jour les filtres du dashboard.
-    Renvoie {id, dashcard_count}.
+
+    `tabs` (optionnel) définit les onglets du dashboard et REMPLACE les onglets existants :
+      [{"id": -1, "name": "Vue d'ensemble"}, {"id": -2, "name": "Posts"}]
+    Ids négatifs pour les nouveaux onglets ; pour conserver ou renommer un onglet existant,
+    reprendre son id réel (donné par `get_dashboard`) ; un onglet absent de la liste est
+    supprimé, et `tabs=[]` retire tous les onglets. Chaque dashcard se range dans un onglet
+    par son `dashboard_tab_id` (row et col comptent à l'intérieur de l'onglet). Les filtres
+    du dashboard sont communs à tous les onglets.
+    Renvoie {id, dashcard_count, tabs}.
     """
-    payload: dict[str, Any] = {"dashcards": dashcards}
-    if parameters is not None:
-        payload["parameters"] = parameters
+    payload = _dashboard_payload(dashcards, parameters, tabs)
     d = _put(f"/api/dashboard/{dashboard_id}", json=payload)
-    return {"id": d["id"], "dashcard_count": len(d.get("dashcards", []))}
+    return {
+        "id": d["id"],
+        "dashcard_count": len(d.get("dashcards", [])),
+        "tabs": [{"id": t["id"], "name": t.get("name")} for t in d.get("tabs") or []],
+    }
 
 
 if __name__ == "__main__":
